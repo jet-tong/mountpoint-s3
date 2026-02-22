@@ -199,7 +199,7 @@ If necessary, you can use the `--endpoint-url` command-line argument to fully ov
 We also support the `AWS_ENDPOINT_URL` environment variable. The endpoint determination follows this order:
 - Use the CLI parameter `endpoint-url` if provided.
 - Use `AWS_ENDPOINT_URL` if provided.
-- Fallback to automically inferring the endpoint.
+- Fallback to automatically inferring the endpoint.
 
 ### Data encryption
 
