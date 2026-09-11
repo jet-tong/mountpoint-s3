@@ -240,7 +240,7 @@ rusty_fork_test! {
             let cache_config = DiskDataCacheConfig {
                 cache_directory: cache_dir.path().to_path_buf(),
                 block_size,
-                limit: mountpoint_s3_fs::data_cache::CacheLimit::TotalSize { max_size: 2 * 1024 * 1024 },
+                limit: mountpoint_s3_fs::data_cache::CacheLimit::TotalSize { max_size: 2 * 1024 * 1024, min_available_ratio: mountpoint_s3_fs::data_cache::DEFAULT_CACHE_MIN_AVAILABLE_RATIO },
             };
             DiskDataCache::new(cache_config, pool)
         })("test_cache_metrics", TestSessionConfig::default());
@@ -286,7 +286,7 @@ rusty_fork_test! {
             let disk_config = DiskDataCacheConfig {
                 cache_directory: cache_dir.path().to_path_buf(),
                 block_size,
-                limit: mountpoint_s3_fs::data_cache::CacheLimit::TotalSize { max_size: 2 * 1024 * 1024 },
+                limit: mountpoint_s3_fs::data_cache::CacheLimit::TotalSize { max_size: 2 * 1024 * 1024, min_available_ratio: mountpoint_s3_fs::data_cache::DEFAULT_CACHE_MIN_AVAILABLE_RATIO },
             };
             let disk_cache = Arc::new(DiskDataCache::new(disk_config, pool.clone()));
 

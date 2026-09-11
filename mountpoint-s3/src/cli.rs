@@ -8,7 +8,9 @@ use mountpoint_s3_client::config::{AWSCRT_LOG_TARGET, AddressingStyle, S3ClientA
 use mountpoint_s3_client::instance_info::InstanceInfo;
 use mountpoint_s3_client::user_agent::UserAgent;
 use mountpoint_s3_fs::content_type::ContentTypeDetection;
-use mountpoint_s3_fs::data_cache::{CacheLimit, DataCacheConfig, DiskDataCacheConfig, ExpressDataCacheConfig};
+use mountpoint_s3_fs::data_cache::{
+    CacheLimit, DEFAULT_CACHE_MIN_AVAILABLE_RATIO, DataCacheConfig, DiskDataCacheConfig, ExpressDataCacheConfig,
+};
 use mountpoint_s3_fs::fs::{CacheConfig, ServerSideEncryption, TimeToLive, UploadChecksumAlgorithm};
 use mountpoint_s3_fs::fuse::config::{FuseOptions, FuseSessionConfig, MountPoint};
 use mountpoint_s3_fs::logging::{LoggingConfig, prepare_log_file_name};
@@ -372,6 +374,16 @@ store.\
     )]
     pub max_cache_size: Option<u64>,
 
+    #[clap(
+        long,
+        help = "Stop caching while the cache filesystem has less than this fraction of its total space available [default: 0.05]",
+        value_name = "RATIO",
+        value_parser = parse_cache_min_available_ratio,
+        help_heading = CACHING_OPTIONS_HEADER,
+        requires = "cache",
+    )]
+    pub cache_min_available_ratio: Option<f64>,
+
     #[cfg(feature = "block_size")]
     #[clap(
         long,
@@ -642,13 +654,20 @@ impl CliArgs {
 
     fn disk_data_cache_config(&self) -> Option<DiskDataCacheConfig> {
         let path = self.cache.as_ref()?;
+        // The floor applies whether or not a size cap was given, so both arms below take it.
+        let min_available_ratio = self
+            .cache_min_available_ratio
+            .unwrap_or(DEFAULT_CACHE_MIN_AVAILABLE_RATIO);
         let cache_limit = match self.max_cache_size {
             // Fallback to no data cache.
             Some(0) => return None,
             Some(max_size_in_mib) => CacheLimit::TotalSize {
                 max_size: (max_size_in_mib * 1024 * 1024) as usize,
+                min_available_ratio,
             },
-            None => CacheLimit::default(),
+            None => CacheLimit::AvailableSpace {
+                min_ratio: min_available_ratio,
+            },
         };
         let cache_config = DiskDataCacheConfig {
             cache_directory: path.clone(),
@@ -887,8 +906,36 @@ fn parse_bucket_name_or_s3_uri(bucket_name_or_uri: &str) -> Result<BucketNameOrS
     }
 }
 
+/// Parse and validate `--cache-min-available-ratio`.
+///
+/// A ratio of 1.0 or more would mean "never cache", and a negative one "never stop", so both are
+/// rejected rather than silently producing a cache that does nothing.
+fn parse_cache_min_available_ratio(value: &str) -> Result<f64, String> {
+    let ratio: f64 = value.parse().map_err(|_| format!("`{value}` is not a number"))?;
+    if (0.0..1.0).contains(&ratio) {
+        Ok(ratio)
+    } else {
+        Err(format!("`{ratio}` must be at least 0.0 and less than 1.0"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_parse_cache_min_available_ratio() {
+        // 0.0 opts out of the floor and 1.0 would disable caching entirely, so the range is
+        // half-open. `contains` also rejects NaN, which would otherwise compare false to
+        // everything and silently behave like 0.0.
+        assert_eq!(parse_cache_min_available_ratio("0.15").unwrap(), 0.15);
+        assert_eq!(parse_cache_min_available_ratio("0").unwrap(), 0.0);
+        for bad in ["1.0", "1.5", "-0.1", "NaN", "", "abc"] {
+            assert!(
+                parse_cache_min_available_ratio(bad).is_err(),
+                "{bad} should be rejected"
+            );
+        }
+    }
+
     use super::*;
     use test_case::test_case;
 

@@ -60,8 +60,20 @@ pub struct DiskDataCacheConfig {
 #[derive(Debug)]
 pub enum CacheLimit {
     Unbounded,
-    TotalSize { max_size: usize },
-    AvailableSpace { min_ratio: f64 },
+    /// Bound this process's own cache usage to `max_size` bytes, and also stop caching once the
+    /// cache filesystem has less than `min_available_ratio` of its space free.
+    ///
+    /// The floor is not redundant with `max_size`. A size cap only tracks what *this* process has
+    /// written, so several Mountpoint processes sharing a cache filesystem can fill it between them
+    /// while each stays under its own cap, and a single process can be given a cap larger than the
+    /// filesystem it is caching into.
+    TotalSize {
+        max_size: usize,
+        min_available_ratio: f64,
+    },
+    AvailableSpace {
+        min_ratio: f64,
+    },
 }
 
 /// Default minimum ratio of available space to preserve when using AvailableSpace cache limit.
@@ -412,22 +424,30 @@ impl DiskDataCache {
         metrics::gauge!(CACHE_TOTAL_SIZE, ATTR_CACHE => CACHE_DISK).set(size as f64);
         match self.config.limit {
             CacheLimit::Unbounded => false,
-            CacheLimit::TotalSize { max_size } => size > max_size,
-            CacheLimit::AvailableSpace { min_ratio } => {
-                let stats = match nix::sys::statvfs::statvfs(&self.config.cache_directory) {
-                    Ok(stats) if stats.blocks() == 0 => {
-                        warn!("unable to determine available space (0 blocks reported)");
-                        return false;
-                    }
-                    Ok(stats) => stats,
-                    Err(error) => {
-                        warn!(?error, "unable to determine available space");
-                        return false;
-                    }
-                };
-                (stats.blocks_available() as f64) < min_ratio * (stats.blocks() as f64)
-            }
+            CacheLimit::TotalSize {
+                max_size,
+                min_available_ratio,
+            } => size > max_size || self.is_available_space_low(min_available_ratio),
+            CacheLimit::AvailableSpace { min_ratio } => self.is_available_space_low(min_ratio),
         }
+    }
+
+    /// Whether the cache directory's filesystem has less than `min_ratio` of its total space
+    /// available. Returns `false` if the filesystem cannot be queried, so that a cache is never
+    /// disabled by a failure to read it.
+    fn is_available_space_low(&self, min_ratio: f64) -> bool {
+        let stats = match nix::sys::statvfs::statvfs(&self.config.cache_directory) {
+            Ok(stats) if stats.blocks() == 0 => {
+                warn!("unable to determine available space (0 blocks reported)");
+                return false;
+            }
+            Ok(stats) => stats,
+            Err(error) => {
+                warn!(?error, "unable to determine available space");
+                return false;
+            }
+        };
+        (stats.blocks_available() as f64) < min_ratio * (stats.blocks() as f64)
     }
 
     fn evict_if_needed(&self) -> DataCacheResult<()> {
@@ -681,6 +701,74 @@ mod tests {
             expected_bytes, serialized_bytes,
             "serialized disk format appears to have changed, version bump required"
         );
+    }
+
+    #[test]
+    fn test_total_size_limit_also_enforces_available_space() {
+        let cache_directory = tempfile::tempdir().unwrap();
+        let pool = PagedPool::config()
+            .with_candidate_sizes([CandidateSize::new(1024)])
+            .with_no_memory_limit()
+            .build();
+        let new_cache = |limit| {
+            DiskDataCache::new(
+                DiskDataCacheConfig {
+                    cache_directory: cache_directory.path().to_path_buf(),
+                    block_size: 1024,
+                    limit,
+                },
+                pool.clone(),
+            )
+        };
+
+        // A `TotalSize` cache must also respect the available-space floor, otherwise several
+        // processes each under their own cap could fill the filesystem between them, and a single
+        // process could be given a cap larger than its filesystem. A `min_available_ratio` of 1.0
+        // demands the filesystem be entirely free, which it never is, so it stands in for a
+        // filesystem that is out of space.
+        let floor_always_low = new_cache(CacheLimit::TotalSize {
+            max_size: usize::MAX,
+            min_available_ratio: 1.0,
+        });
+        assert!(floor_always_low.is_limit_exceeded(0));
+
+        // The floor is configurable, and a ratio of 0.0 opts out of it: only the size cap applies.
+        // The size-cap assertions use this cache rather than one on the default ratio, so they do
+        // not depend on how full the host's filesystem happens to be.
+        let no_floor = new_cache(CacheLimit::TotalSize {
+            max_size: 1024,
+            min_available_ratio: 0.0,
+        });
+        assert!(!no_floor.is_limit_exceeded(512));
+        assert!(no_floor.is_limit_exceeded(2048));
+
+        // The same floor still works on its own, without a size cap.
+        let available_space_only = new_cache(CacheLimit::AvailableSpace { min_ratio: 1.0 });
+        assert!(available_space_only.is_available_space_low(1.0));
+        assert!(available_space_only.is_limit_exceeded(0));
+
+        // Unbounded ignores both.
+        assert!(!new_cache(CacheLimit::Unbounded).is_limit_exceeded(usize::MAX));
+    }
+
+    #[test]
+    fn test_available_space_low_is_false_when_filesystem_cannot_be_queried() {
+        let pool = PagedPool::config()
+            .with_candidate_sizes([CandidateSize::new(1024)])
+            .with_no_memory_limit()
+            .build();
+        // statvfs fails on a path that does not exist. A cache must not be treated as full just
+        // because its filesystem could not be read.
+        let cache = DiskDataCache::new(
+            DiskDataCacheConfig {
+                cache_directory: PathBuf::from("/this-path-does-not-exist-mountpoint-cache-test"),
+                block_size: 1024,
+                limit: CacheLimit::AvailableSpace { min_ratio: 1.0 },
+            },
+            pool,
+        );
+        assert!(!cache.is_available_space_low(1.0));
+        assert!(!cache.is_limit_exceeded(0));
     }
 
     #[test]
@@ -998,7 +1086,10 @@ mod tests {
             DiskDataCacheConfig {
                 cache_directory: cache_directory.path().to_path_buf(),
                 block_size: BLOCK_SIZE as u64,
-                limit: CacheLimit::TotalSize { max_size: CACHE_LIMIT },
+                limit: CacheLimit::TotalSize {
+                    max_size: CACHE_LIMIT,
+                    min_available_ratio: DEFAULT_CACHE_MIN_AVAILABLE_RATIO,
+                },
             },
             pool,
         );

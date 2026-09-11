@@ -170,6 +170,7 @@ impl ConfigOptions {
             Some(0) => return Err(anyhow!("Cache limit cannot be zero")),
             Some(max_size_bytes) => CacheLimit::TotalSize {
                 max_size: max_size_bytes as usize,
+                min_available_ratio: mountpoint_s3_fs::data_cache::DEFAULT_CACHE_MIN_AVAILABLE_RATIO,
             },
             None => CacheLimit::default(),
         };
